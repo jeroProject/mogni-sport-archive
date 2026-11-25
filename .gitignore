@@ -1,0 +1,4 @@
+.idea/
+
+# Variables de docker-compose.yml (ver .env.example)
+.env

@@ -1,0 +1,573 @@
+package mogni.system_backend.turno.service;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyCollection;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.verify;
+
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import mogni.system_backend.cuota.CuotasDePrueba;
+import mogni.system_backend.alumno.entity.Alumno;
+import mogni.system_backend.alumno.repository.AlumnoRepository;
+import mogni.system_backend.auth.entity.Cuenta;
+import mogni.system_backend.auth.entity.Rol;
+import mogni.system_backend.exception.AccesoDenegadoException;
+import mogni.system_backend.exception.RegistroInvalidoException;
+import mogni.system_backend.inscripcion.entity.EstadoInscripcion;
+import mogni.system_backend.inscripcion.entity.Inscripcion;
+import mogni.system_backend.membresia.entity.Membresia;
+import mogni.system_backend.turno.dto.EstadoTurnoAlumno;
+import mogni.system_backend.turno.dto.TurnoDisponibleResponse;
+import mogni.system_backend.turno.dto.TurnosDisponiblesResponse;
+import mogni.system_backend.turno.entity.EstadoReserva;
+import mogni.system_backend.turno.entity.EstadoTurno;
+import mogni.system_backend.turno.entity.Reserva;
+import mogni.system_backend.turno.entity.Turno;
+import mogni.system_backend.turno.repository.ClaseExtraRepository;
+import mogni.system_backend.turno.repository.ReservaRepository;
+
+/**
+ * HU-259. Los repositorios se simulan con listas en memoria (turnos por fecha y reservas), así cada prueba
+ * arma el escenario y las consultas filtran igual que la base.
+ */
+@ExtendWith(MockitoExtension.class)
+class ConsultaTurnosServiceTest {
+
+    private static final String EMAIL = "lucia@mail.com";
+    /** Martes 13/10/2026 a las 10:30. */
+    private static final LocalDate MARTES = LocalDate.of(2026, 10, 13);
+    private static final LocalDate MIERCOLES = MARTES.plusDays(1);
+    private static final LocalDate JUEVES = MARTES.plusDays(2);
+    private static final LocalDateTime MARTES_10_30 = MARTES.atTime(10, 30);
+
+    @Mock
+    private AlumnoRepository alumnoRepository;
+
+    @Mock
+    private ReservaRepository reservaRepository;
+
+    @Mock
+    private GeneracionTurnosService generacionTurnosService;
+
+    // Sin configurar no le queda ninguna clase extra (existeDisponible devuelve false)
+    @Mock
+    private ClaseExtraRepository claseExtraRepository;
+
+    @InjectMocks
+    private ConsultaTurnosService consultaTurnosService;
+
+    private Alumno alumno;
+    private Alumno otroAlumno;
+    private final Map<LocalDate, List<Turno>> turnosPorFecha = new HashMap<>();
+    private final List<Reserva> reservas = new ArrayList<>();
+    private long proximoId = 1;
+
+    @BeforeEach
+    void setUp() {
+        alumno = alumno(10L, true, 3);
+        otroAlumno = alumno(20L, true, 5);
+
+        lenient().when(alumnoRepository.findByCuentaEmailIgnoreCase(EMAIL)).thenAnswer(inv -> Optional.of(alumno));
+        lenient().when(generacionTurnosService.obtenerOGenerarTurnos(any(LocalDate.class)))
+                .thenAnswer(inv -> turnosPorFecha.getOrDefault(inv.<LocalDate>getArgument(0), List.of()));
+        lenient().when(reservaRepository.findByTurnoIdInAndEstado(anyCollection(), any(EstadoReserva.class)))
+                .thenAnswer(inv -> {
+                    Collection<Long> ids = inv.getArgument(0);
+                    EstadoReserva estado = inv.getArgument(1);
+                    return reservas.stream()
+                            .filter(r -> ids.contains(r.getTurno().getId()) && r.getEstado() == estado)
+                            .toList();
+                });
+        lenient().when(reservaRepository.findByAlumnoIdAndEstadoInAndTurnoFechaBetween(
+                        anyLong(), anyCollection(), any(LocalDate.class), any(LocalDate.class)))
+                .thenAnswer(inv -> {
+                    Long alumnoId = inv.getArgument(0);
+                    Collection<EstadoReserva> estados = inv.getArgument(1);
+                    LocalDate desde = inv.getArgument(2);
+                    LocalDate hasta = inv.getArgument(3);
+                    return reservas.stream()
+                            .filter(r -> r.getAlumno().getId().equals(alumnoId) && estados.contains(r.getEstado()))
+                            .filter(r -> !r.getTurno().getFecha().isBefore(desde) && !r.getTurno().getFecha().isAfter(hasta))
+                            .toList();
+                });
+    }
+
+    // --- Armado del escenario ---
+
+    private static Alumno alumno(Long id, boolean activa, Integer frecuenciaSemanal) {
+        Alumno a = new Alumno();
+        a.setId(id);
+        a.setCuenta(new Cuenta(id, "a" + id + "@mail.com", "hash", Rol.ALUMNO, false, activa, null));
+        if (frecuenciaSemanal != null) {
+            Membresia membresia = new Membresia(1L, "Plan", 30000.0, frecuenciaSemanal, null);
+            a.agregarInscripcion(new Inscripcion(1L, MARTES.minusMonths(1), null, EstadoInscripcion.ACTIVA, a, membresia));
+        }
+        return a;
+    }
+
+    private Turno turno(LocalDate fecha, String inicio, int cupo) {
+        return turno(fecha, inicio, cupo, EstadoTurno.DISPONIBLE);
+    }
+
+    private Turno turno(LocalDate fecha, String inicio, int cupo, EstadoTurno estado) {
+        LocalTime horaInicio = LocalTime.parse(inicio);
+        Turno turno = new Turno(proximoId++, fecha, horaInicio, horaInicio.plusHours(1), cupo, estado);
+        turnosPorFecha.computeIfAbsent(fecha, f -> new ArrayList<>()).add(turno);
+        return turno;
+    }
+
+    private void reservar(Alumno quien, Turno turno, EstadoReserva estado) {
+        reservas.add(new Reserva(proximoId++, quien, turno, MARTES.atStartOfDay(), estado));
+    }
+
+    private TurnosDisponiblesResponse consultar(LocalDate fecha, LocalDateTime ahora) {
+        return consultaTurnosService.consultarTurnosDisponibles(EMAIL, fecha, ahora);
+    }
+
+    private static TurnoDisponibleResponse buscar(TurnosDisponiblesResponse response, String horaInicio) {
+        return response.getTurnos().stream()
+                .filter(t -> t.getHoraInicio().equals(horaInicio))
+                .findFirst()
+                .orElseThrow();
+    }
+
+    // --- Acceso ---
+
+    // Pruebas 2 y 3
+    @Test
+    void alumnoInactivoNoPuedeConsultar() {
+        alumno = alumno(10L, false, 3);
+
+        AccesoDenegadoException ex = assertThrows(AccesoDenegadoException.class, () -> consultar(null, MARTES_10_30));
+        assertEquals("Tu cuenta está inactiva.", ex.getMessage());
+    }
+
+    @Test
+    void fechaFueraDeHoyAPasadoManianaDa400() {
+        assertThrows(RegistroInvalidoException.class, () -> consultar(MARTES.plusDays(3), MARTES_10_30));
+        assertThrows(RegistroInvalidoException.class, () -> consultar(MARTES.minusDays(1), MARTES_10_30));
+    }
+
+    // Pedido del dueño: también se puede consultar (y reservar) pasado mañana
+    @Test
+    void pasadoMananaSePuedeConsultar() {
+        turno(JUEVES, "18:00", 5);
+
+        TurnosDisponiblesResponse response = consultar(JUEVES, MARTES_10_30);
+
+        assertEquals(JUEVES, response.getFechaSeleccionada());
+        assertTrue(buscar(response, "18:00").isSeleccionable());
+    }
+
+    // --- Días y generación ---
+
+    // Pruebas 1, 4 y 5
+    @Test
+    void sinFechaEsHoyYMuestraCincoDiasConHoyManianaYPasadoHabilitados() {
+        turno(MARTES, "19:00", 5);
+        turno(MIERCOLES, "08:00", 5);
+        turno(JUEVES, "08:00", 5);
+
+        TurnosDisponiblesResponse response = consultar(null, MARTES_10_30);
+
+        assertEquals(MARTES, response.getHoy());
+        assertEquals(MARTES, response.getFechaSeleccionada());
+        assertEquals(5, response.getDias().size());
+        assertEquals(MARTES, response.getDias().get(0).getFecha());
+        assertEquals(MARTES.plusDays(4), response.getDias().get(4).getFecha());
+        assertEquals(List.of(true, true, true, false, false),
+                response.getDias().stream().map(d -> d.isHabilitado()).toList());
+    }
+
+    @Test
+    void unDiaSinTurnosApareceDeshabilitadoEnElSelector() {
+        // Hoy tiene turnos y mañana (por ejemplo, un sábado sin clases) no
+        turno(MARTES, "19:00", 5);
+
+        TurnosDisponiblesResponse response = consultar(null, MARTES_10_30);
+
+        assertEquals(List.of(true, false, false, false, false),
+                response.getDias().stream().map(d -> d.isHabilitado()).toList());
+    }
+
+    // Criterio 16: siempre se aseguran los días que se pueden reservar, se consulte el día que se consulte
+    @Test
+    void siempreGeneraHoyManianaYPasado() {
+        consultar(MIERCOLES, MARTES_10_30);
+
+        verify(generacionTurnosService).obtenerOGenerarTurnos(MARTES);
+        verify(generacionTurnosService).obtenerOGenerarTurnos(MIERCOLES);
+        verify(generacionTurnosService).obtenerOGenerarTurnos(JUEVES);
+    }
+
+    // Pruebas 15 y 22
+    @Test
+    void sinTurnosDevuelveListaVacia() {
+        assertTrue(consultar(MIERCOLES, MARTES_10_30).getTurnos().isEmpty());
+    }
+
+    // --- Lista de turnos ---
+
+    // Pruebas 6 y 9: hoy no se muestran los que ya empezaron (incluido el que empieza justo ahora)
+    @Test
+    void hoyOcultaLosTurnosQueYaEmpezaron() {
+        turno(MARTES, "08:00", 5);
+        turno(MARTES, "10:00", 5);
+        turno(MARTES, "10:30", 5);
+        turno(MARTES, "18:00", 5);
+        turno(MARTES, "11:00", 5);
+
+        TurnosDisponiblesResponse response = consultar(MARTES, MARTES_10_30);
+
+        assertEquals(List.of("11:00", "18:00"), response.getTurnos().stream().map(TurnoDisponibleResponse::getHoraInicio).toList());
+    }
+
+    @Test
+    void manianaMuestraTodosLosTurnosOrdenados() {
+        turno(MIERCOLES, "08:00", 5);
+        turno(MIERCOLES, "09:00", 5);
+
+        TurnosDisponiblesResponse response = consultar(MIERCOLES, MARTES_10_30);
+
+        assertEquals(List.of("08:00", "09:00"), response.getTurnos().stream().map(TurnoDisponibleResponse::getHoraInicio).toList());
+        assertEquals("09:00", response.getTurnos().get(0).getHoraFin());
+    }
+
+    // Pruebas 7, 8 y 10: lugares libres = cupo del turno − reservas activas; las canceladas no ocupan lugar
+    @Test
+    void lugaresLibresNoCuentanLasReservasCanceladas() {
+        Turno turno = turno(MIERCOLES, "08:00", 5);
+        reservar(otroAlumno, turno, EstadoReserva.RESERVADA);
+        reservar(otroAlumno, turno, EstadoReserva.RESERVADA);
+        reservar(otroAlumno, turno, EstadoReserva.CANCELADA);
+        reservar(otroAlumno, turno, EstadoReserva.CANCELADA_POR_GIMNASIO);
+
+        TurnoDisponibleResponse respuesta = consultar(MIERCOLES, MARTES_10_30).getTurnos().get(0);
+
+        assertEquals(3, respuesta.getLugaresLibres());
+        assertEquals(EstadoTurnoAlumno.DISPONIBLE, respuesta.getEstado());
+        assertTrue(respuesta.isSeleccionable());
+    }
+
+    @Test
+    void lugaresLibresUsanElCupoDelTurnoYNuncaSonNegativos() {
+        Turno turno = turno(MIERCOLES, "08:00", 1);
+        reservar(otroAlumno, turno, EstadoReserva.RESERVADA);
+        reservar(otroAlumno, turno, EstadoReserva.RESERVADA);
+
+        assertEquals(0, consultar(MIERCOLES, MARTES_10_30).getTurnos().get(0).getLugaresLibres());
+    }
+
+    // Prueba 11
+    @Test
+    void turnoSinLugaresEsCompletoYNoSeleccionable() {
+        Turno turno = turno(MIERCOLES, "08:00", 2);
+        reservar(otroAlumno, turno, EstadoReserva.RESERVADA);
+        reservar(otroAlumno, turno, EstadoReserva.RESERVADA);
+
+        TurnoDisponibleResponse respuesta = consultar(MIERCOLES, MARTES_10_30).getTurnos().get(0);
+
+        assertEquals(EstadoTurnoAlumno.COMPLETO, respuesta.getEstado());
+        assertFalse(respuesta.isSeleccionable());
+    }
+
+    // Pruebas 14 y 23: un turno cancelado no se puede elegir, los demás del día siguen disponibles
+    @Test
+    void turnoCanceladoNoSeleccionableYLosDemasSiguenDisponibles() {
+        turno(MIERCOLES, "08:00", 5, EstadoTurno.CANCELADO);
+        turno(MIERCOLES, "09:00", 5);
+
+        TurnosDisponiblesResponse response = consultar(MIERCOLES, MARTES_10_30);
+
+        assertEquals(EstadoTurnoAlumno.CANCELADO, buscar(response, "08:00").getEstado());
+        assertFalse(buscar(response, "08:00").isSeleccionable());
+        assertEquals(EstadoTurnoAlumno.DISPONIBLE, buscar(response, "09:00").getEstado());
+        assertTrue(buscar(response, "09:00").isSeleccionable());
+    }
+
+    @Test
+    void canceladoTienePrioridadSobreReservadoYCompleto() {
+        Turno turno = turno(MIERCOLES, "08:00", 1, EstadoTurno.CANCELADO);
+        reservar(alumno, turno, EstadoReserva.RESERVADA);
+
+        assertEquals(EstadoTurnoAlumno.CANCELADO, consultar(MIERCOLES, MARTES_10_30).getTurnos().get(0).getEstado());
+    }
+
+    // Pruebas 12 y 13: el turno reservado se marca (aunque esté lleno) y bloquea los demás del día
+    @Test
+    void conUnTurnoReservadoEnElDiaLosDemasNoSeSeleccionan() {
+        Turno reservado = turno(MIERCOLES, "19:00", 1);
+        turno(MIERCOLES, "08:00", 5);
+        reservar(alumno, reservado, EstadoReserva.RESERVADA);
+
+        TurnosDisponiblesResponse response = consultar(MIERCOLES, MARTES_10_30);
+
+        assertTrue(response.isTieneReservaEnElDia());
+        assertEquals(EstadoTurnoAlumno.RESERVADO, buscar(response, "19:00").getEstado());
+        assertFalse(buscar(response, "19:00").isSeleccionable());
+        assertEquals(EstadoTurnoAlumno.DISPONIBLE, buscar(response, "08:00").getEstado());
+        assertFalse(buscar(response, "08:00").isSeleccionable());
+    }
+
+    @Test
+    void unaReservaCanceladaNoCuentaComoReservaDelDia() {
+        Turno turno = turno(MIERCOLES, "08:00", 5);
+        reservar(alumno, turno, EstadoReserva.CANCELADA);
+
+        TurnosDisponiblesResponse response = consultar(MIERCOLES, MARTES_10_30);
+
+        assertFalse(response.isTieneReservaEnElDia());
+        assertEquals(EstadoTurnoAlumno.DISPONIBLE, response.getTurnos().get(0).getEstado());
+        assertTrue(response.getTurnos().get(0).isSeleccionable());
+    }
+
+    @Test
+    void laReservaDeOtroDiaNoBloqueaElDiaSeleccionado() {
+        Turno hoy = turno(MARTES, "08:00", 5);
+        turno(MIERCOLES, "08:00", 5);
+        reservar(alumno, hoy, EstadoReserva.RESERVADA);
+
+        TurnosDisponiblesResponse response = consultar(MIERCOLES, MARTES_10_30);
+
+        assertFalse(response.isTieneReservaEnElDia());
+        assertTrue(response.getTurnos().get(0).isSeleccionable());
+    }
+
+    // --- Contador semanal ---
+
+    // Pruebas 16 y 17
+    @Test
+    void contadorRestaSoloLasReservasActivasDeLaSemana() {
+        Turno lunes = turno(MARTES.minusDays(1), "08:00", 5);
+        Turno hoy = turno(MARTES, "08:00", 5);
+        Turno semanaAnterior = turno(MARTES.minusDays(7), "08:00", 5);
+        reservar(alumno, lunes, EstadoReserva.RESERVADA);
+        reservar(alumno, hoy, EstadoReserva.CANCELADA);
+        reservar(alumno, semanaAnterior, EstadoReserva.RESERVADA);
+
+        assertEquals(2, consultar(MIERCOLES, MARTES_10_30).getTurnosRestantesSemana());
+    }
+
+    // Prueba 19
+    @Test
+    void conElContadorEnCeroNoSePuedeElegirNingunTurno() {
+        alumno = alumno(10L, true, 1);
+        Turno lunes = turno(MARTES.minusDays(1), "08:00", 5);
+        reservar(alumno, lunes, EstadoReserva.RESERVADA);
+        turno(MIERCOLES, "08:00", 5);
+
+        TurnosDisponiblesResponse response = consultar(MIERCOLES, MARTES_10_30);
+
+        assertEquals(0, response.getTurnosRestantesSemana());
+        assertEquals(EstadoTurnoAlumno.DISPONIBLE, response.getTurnos().get(0).getEstado());
+        assertFalse(response.getTurnos().get(0).isSeleccionable());
+    }
+
+    // MOGNI-281: igual que la reserva, con la semana completa una clase por recuperar deja elegir los turnos
+    @Test
+    void conLaSemanaCompletaYUnaClasePorRecuperarElContadorLaSumaYSePuedeElegir() {
+        alumno = alumno(10L, true, 1);
+        Turno lunes = turno(MARTES.minusDays(1), "08:00", 5);
+        reservar(alumno, lunes, EstadoReserva.RESERVADA);
+        turno(MIERCOLES, "08:00", 5);
+        lenient().when(claseExtraRepository.existeDisponible(10L, MIERCOLES)).thenReturn(true);
+        lenient().when(claseExtraRepository.contarDeLaSemana(10L, MIERCOLES, LocalDate.of(2026, 10, 12))).thenReturn(1L);
+
+        TurnosDisponiblesResponse response = consultar(MIERCOLES, MARTES_10_30);
+
+        assertEquals(1, response.getTurnosRestantesSemana());
+        assertTrue(response.getTurnos().get(0).isSeleccionable());
+    }
+
+    @Test
+    void cuandoElGimnasioLeCancelaUnTurnoElContadorSeLoDevuelve() {
+        alumno = alumno(10L, true, 2);
+        reservar(alumno, turno(MARTES.minusDays(1), "08:00", 5), EstadoReserva.RESERVADA);
+        reservar(alumno, turno(MARTES, "08:00", 5, EstadoTurno.CANCELADO), EstadoReserva.CANCELADA_POR_GIMNASIO);
+        turno(MIERCOLES, "08:00", 5);
+        lenient().when(claseExtraRepository.existeDisponible(10L, MIERCOLES)).thenReturn(true);
+        lenient().when(claseExtraRepository.contarDeLaSemana(10L, MIERCOLES, LocalDate.of(2026, 10, 12))).thenReturn(1L);
+
+        TurnosDisponiblesResponse response = consultar(MIERCOLES, MARTES_10_30);
+
+        // 2 de la membresía, uno usado y otro cancelado por el gimnasio: le queda 1, el que va a recuperar
+        assertEquals(1, response.getTurnosRestantesSemana());
+        assertEquals(0, response.getClasesParaRecuperar());
+        assertTrue(response.getTurnos().get(0).isSeleccionable());
+    }
+
+    @Test
+    void laClaseDeUnaSemanaAnteriorSeMuestraAparteParaRecuperar() {
+        alumno = alumno(10L, true, 1);
+        reservar(alumno, turno(MARTES.minusDays(1), "08:00", 5), EstadoReserva.RESERVADA);
+        turno(MIERCOLES, "08:00", 5);
+        lenient().when(claseExtraRepository.existeDisponible(10L, MIERCOLES)).thenReturn(true);
+        lenient().when(claseExtraRepository.contarDeSemanasAnteriores(10L, MIERCOLES, LocalDate.of(2026, 10, 12)))
+                .thenReturn(1L);
+
+        TurnosDisponiblesResponse response = consultar(MIERCOLES, MARTES_10_30);
+
+        // Usó el turno de la semana; le queda la clase de la semana pasada, aparte
+        assertEquals(0, response.getTurnosRestantesSemana());
+        assertEquals(1, response.getClasesParaRecuperar());
+        assertTrue(response.getTurnos().get(0).isSeleccionable());
+    }
+
+    // Prueba 18: un domingo, el lunes ya es otra semana
+    @Test
+    void elDomingoElContadorDelLunesEsDeLaSemanaSiguiente() {
+        LocalDate domingo = LocalDate.of(2026, 10, 18);
+        LocalDate lunes = domingo.plusDays(1);
+        LocalDateTime domingoALas9 = domingo.atTime(9, 0);
+        reservar(alumno, turno(domingo.minusDays(5), "08:00", 5), EstadoReserva.RESERVADA);
+        reservar(alumno, turno(domingo.minusDays(3), "08:00", 5), EstadoReserva.RESERVADA);
+        reservar(alumno, turno(domingo.minusDays(1), "08:00", 5), EstadoReserva.RESERVADA);
+
+        assertEquals(0, consultar(domingo, domingoALas9).getTurnosRestantesSemana());
+        assertEquals(3, consultar(lunes, domingoALas9).getTurnosRestantesSemana());
+    }
+
+    @Test
+    void sinInscripcionActivaNoLeQuedanTurnos() {
+        alumno = alumno(10L, true, null);
+        turno(MIERCOLES, "08:00", 5);
+
+        TurnosDisponiblesResponse response = consultar(MIERCOLES, MARTES_10_30);
+
+        assertEquals(0, response.getTurnosRestantesSemana());
+        assertFalse(response.getTurnos().get(0).isSeleccionable());
+    }
+
+    @Test
+    void elContadorNuncaEsNegativo() {
+        alumno = alumno(10L, true, 1);
+        reservar(alumno, turno(MARTES.minusDays(1), "08:00", 5), EstadoReserva.RESERVADA);
+        reservar(alumno, turno(MARTES, "08:00", 5), EstadoReserva.RESERVADA);
+
+        assertEquals(0, consultar(MIERCOLES, MARTES_10_30).getTurnosRestantesSemana());
+        verify(reservaRepository).findByAlumnoIdAndEstadoInAndTurnoFechaBetween(
+                eq(10L), eq(ReglasReserva.CUENTAN_PARA_LA_SEMANA), eq(LocalDate.of(2026, 10, 12)), eq(LocalDate.of(2026, 10, 18)));
+    }
+
+    // --- Cuota en mora (MOGNI-259) ---
+
+    @Test
+    void alumnoEnMoraVeLosTurnosPeroNoPuedeElegirNinguno() {
+        CuotasDePrueba.queVence(alumno.buscarInscripcionActiva().orElseThrow(), MARTES.minusDays(2)); // venció hace 2 días
+        turno(MARTES, "19:00", 5);
+
+        TurnosDisponiblesResponse response = consultar(null, MARTES_10_30);
+
+        assertTrue(response.isBloqueadoPorMora());
+        assertEquals(1, response.getTurnos().size());
+        assertFalse(buscar(response, "19:00").isSeleccionable());
+    }
+
+    @Test
+    void enElDiaDeGraciaLosTurnosDeHoySeEligenYLosDeManianaNo() {
+        CuotasDePrueba.queVence(alumno.buscarInscripcionActiva().orElseThrow(), MARTES.minusDays(1)); // venció ayer
+        turno(MARTES, "19:00", 5);
+        turno(MIERCOLES, "19:00", 5);
+
+        TurnosDisponiblesResponse hoy = consultar(null, MARTES_10_30);
+        assertFalse(hoy.isBloqueadoPorMora());
+        assertFalse(hoy.isBloqueadoPorCuotaVencida());
+        assertTrue(buscar(hoy, "19:00").isSeleccionable());
+
+        TurnosDisponiblesResponse maniana = consultar(MIERCOLES, MARTES_10_30);
+        assertFalse(maniana.isBloqueadoPorMora());
+        assertTrue(maniana.isBloqueadoPorCuotaVencida());
+        assertFalse(buscar(maniana, "19:00").isSeleccionable());
+    }
+
+    @Test
+    void conLaCuotaAlDiaManianaNoQuedaBloqueado() {
+        turno(MIERCOLES, "19:00", 5);
+
+        TurnosDisponiblesResponse maniana = consultar(MIERCOLES, MARTES_10_30);
+
+        assertFalse(maniana.isBloqueadoPorCuotaVencida());
+        assertTrue(buscar(maniana, "19:00").isSeleccionable());
+    }
+
+    @Test
+    void conElMesSiguientePagadoEnUnaProgramadaNoEstaEnMora() {
+        // La cuota de la activa venció hace 2 días, pero ya pagó el período siguiente con otra membresía
+        CuotasDePrueba.queVence(alumno.buscarInscripcionActiva().orElseThrow(), MARTES.minusDays(2));
+        Inscripcion.nueva(alumno, new Membresia(9L, "Full", 38000.0, 5, null), MARTES.minusDays(2),
+                EstadoInscripcion.PROGRAMADA).agregarCuota(MARTES.minusDays(2));
+        turno(MARTES, "19:00", 5);
+
+        TurnosDisponiblesResponse response = consultar(null, MARTES_10_30);
+
+        assertFalse(response.isBloqueadoPorMora());
+    }
+
+    // --- Anticipación mínima de 1 hora (MOGNI-254) ---
+
+    @Test
+    void losTurnosDeHoyConMenosDeUnaHoraSeMuestranPeroNoSePuedenElegir() {
+        turno(MARTES, "11:00", 5); // faltan 30 minutos
+        turno(MARTES, "11:30", 5); // falta exactamente 1 hora
+        turno(MARTES, "11:31", 5); // faltan 61 minutos
+
+        TurnosDisponiblesResponse response = consultar(MARTES, MARTES_10_30);
+
+        assertEquals(List.of("11:00", "11:30", "11:31"),
+                response.getTurnos().stream().map(TurnoDisponibleResponse::getHoraInicio).toList());
+        TurnoDisponibleResponse enTreintaMinutos = buscar(response, "11:00");
+        assertEquals(EstadoTurnoAlumno.DISPONIBLE, enTreintaMinutos.getEstado());
+        assertTrue(enTreintaMinutos.isFaltaMenosDeUnaHora());
+        assertFalse(enTreintaMinutos.isSeleccionable());
+        assertFalse(buscar(response, "11:30").isFaltaMenosDeUnaHora());
+        assertTrue(buscar(response, "11:30").isSeleccionable());
+        assertTrue(buscar(response, "11:31").isSeleccionable());
+    }
+
+    @Test
+    void aLas23_45ElTurnoDeManianaALas00_30NoSePuedeElegir() {
+        LocalDateTime martesALas23_45 = MARTES.atTime(23, 45);
+        turno(MIERCOLES, "00:30", 5);
+        turno(MIERCOLES, "09:00", 5);
+
+        TurnosDisponiblesResponse response = consultar(MIERCOLES, martesALas23_45);
+
+        assertTrue(buscar(response, "00:30").isFaltaMenosDeUnaHora());
+        assertFalse(buscar(response, "00:30").isSeleccionable());
+        assertFalse(buscar(response, "09:00").isFaltaMenosDeUnaHora());
+        assertTrue(buscar(response, "09:00").isSeleccionable());
+    }
+
+    @Test
+    void alumnoVencidoNoEstaBloqueado() {
+        CuotasDePrueba.queVence(alumno.buscarInscripcionActiva().orElseThrow(), MARTES.minusDays(1)); // venció ayer
+        turno(MARTES, "19:00", 5);
+
+        TurnosDisponiblesResponse response = consultar(null, MARTES_10_30);
+
+        assertFalse(response.isBloqueadoPorMora());
+        assertTrue(buscar(response, "19:00").isSeleccionable());
+    }
+}
